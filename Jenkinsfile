@@ -154,7 +154,6 @@ PY
                 do
                   if gsutil ls "$C" >/dev/null 2>&1; then
                     RESOLVED_JAR="$C"
-                    echo "Resolved jar via public GCS: $RESOLVED_JAR"
                     break
                   fi
                 done
@@ -182,7 +181,6 @@ PY
                   echo "Jar already present at $TARGET"
                 fi
                 RESOLVED_JAR="$TARGET"
-                echo "Resolved jar (staged): $RESOLVED_JAR"
               fi
 
               echo "export HADOOP_STREAMING_RESOLVED_JAR=\"$RESOLVED_JAR\"" > .resolved_jar.env
@@ -193,12 +191,13 @@ PY
       }
     }
 
-    stage('Stage code (mapper/reducer) & data to GCS') {
+    stage('Stage code (mapper/reducer) & ALL repo files to GCS') {
       steps {
         container('cloud-sdk') {
           withCredentials([file(credentialsId: env.GCP_SA_CRED, variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
             sh '''#!/usr/bin/env bash
               set -Eeuo pipefail
+
               if [[ -f "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
                 gcloud auth activate-service-account --key-file="${GOOGLE_APPLICATION_CREDENTIALS}"
               fi
@@ -208,50 +207,54 @@ PY
               CODE_PREFIX="${JOB_ROOT}/code"
               DATA_PREFIX="${JOB_ROOT}/data"
 
-              # discover mapper / reducer within repo
+              # discover mapper/reducer in repo (allow nested paths)
               MAP="${MAP:-}"
               RED="${RED:-}"
               if [[ -z "$MAP" ]]; then
-                if [[ -f mapper.py ]]; then MAP=mapper.py; else MAP="$(git ls-files | grep -E '^mapper\\.py$|/?mapper\\.py$' | head -n1)"; fi
+                if [[ -f mapper.py ]]; then MAP=mapper.py; else MAP="$(git ls-files | grep -E '(^|/)mapper\\.py$' | head -n1)"; fi
               fi
               if [[ -z "$RED" ]]; then
-                if [[ -f reducer.py ]]; then RED=reducer.py; else RED="$(git ls-files | grep -E '^reducer\\.py$|/?reducer\\.py$' | head -n1)"; fi
+                if [[ -f reducer.py ]]; then RED=reducer.py; else RED="$(git ls-files | grep -E '(^|/)reducer\\.py$' | head -n1)"; fi
               fi
-              [[ -n "$MAP" && -n "$RED" ]] || { echo "mapper.py/reducer.py not found in repo"; exit 1; }
+              [[ -n "$MAP" && -n "$RED" ]] || { echo "mapper.py/reducer.py not found"; exit 1; }
+
               echo "Mapper: $MAP"
               echo "Reducer: $RED"
 
-              # clean and upload ONLY mapper & reducer under code/
+              # upload mapper & reducer
               gsutil -m rm -r "${CODE_PREFIX}" >/dev/null 2>&1 || true
               gsutil -m cp "$MAP" "${CODE_PREFIX}/"
               gsutil -m cp "$RED" "${CODE_PREFIX}/"
 
-              # pick data files from repo (flat) – .txt/.csv/.log by default
+              # Stage ALL git-tracked files, flattened to top-level.
+              # If duplicate basenames exist, prefix a 6-char hash of the dir.
               gsutil -m rm -r "${DATA_PREFIX}" >/dev/null 2>&1 || true
               mkdir -p /tmp/upload_data
+              dup_check_file=/tmp/upload_data/.seen
+              : > "$dup_check_file"
 
-              found=0
               while IFS= read -r f; do
-                cp "$f" "/tmp/upload_data/$(basename "$f")"
-                found=1
-              done < <(git ls-files | grep -Ei '\\.(txt|csv|log)$' || true)
+                [[ "$f" == .git/* ]] && continue
+                b="$(basename "$f")"
+                if grep -qxF "$b" "$dup_check_file"; then
+                  d="$(dirname "$f")"
+                  h="$(printf '%s' "$d" | sha1sum | cut -c1-6)"
+                  out="${h}__${b}"
+                else
+                  out="$b"
+                  echo "$b" >> "$dup_check_file"
+                fi
+                install -D "$f" "/tmp/upload_data/$out"
+              done < <(git ls-files)
 
-              # if no data files in repo, create a tiny sample
-              if [[ "$found" -eq 0 ]]; then
-                echo "No data files found (*.txt, *.csv, *.log). Creating sample..."
-                cat > /tmp/upload_data/sample.txt <<EOF
-alpha
-beta
-gamma
-alpha
-beta
-alpha
-EOF
+              # If somehow nothing was staged, add a tiny sample
+              if ! compgen -G "/tmp/upload_data/*" > /dev/null; then
+                echo "Repo appears empty; creating sample..."
+                echo "hello" > /tmp/upload_data/sample.txt
               fi
 
               gsutil -m cp /tmp/upload_data/* "${DATA_PREFIX}/"
 
-              # persist paths for submit stage
               {
                 echo "export CODE_PREFIX='${CODE_PREFIX}'"
                 echo "export DATA_PREFIX='${DATA_PREFIX}'"
@@ -273,6 +276,7 @@ EOF
           withCredentials([file(credentialsId: env.GCP_SA_CRED, variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
             sh '''#!/usr/bin/env bash
               set -Eeuo pipefail
+
               if [[ -f "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
                 gcloud auth activate-service-account --key-file="${GOOGLE_APPLICATION_CREDENTIALS}"
               fi
@@ -288,8 +292,6 @@ EOF
               OUT="gs://${BUCKET}/results/${JOB_NAME}/${BUILD_NUMBER}"
               gsutil -m rm -r "${OUT}" >/dev/null 2>&1 || true
 
-              # Use files from flat data prefix only (avoid directories)
-              # Ship mapper/reducer via -files from code prefix
               gcloud dataproc jobs submit hadoop \
                 --cluster="${CLUSTER_NAME}" \
                 --region="${REGION}" \
@@ -303,6 +305,7 @@ EOF
                 -input  "${DATA_PREFIX}/*" \
                 -output "${OUT}"
 
+              # Save + publish results
               gsutil cat "${OUT}"/part-* | tee line_counts.txt
             '''
           }
