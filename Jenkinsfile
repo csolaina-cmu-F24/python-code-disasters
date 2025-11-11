@@ -36,10 +36,11 @@ spec:
     BUCKET       = "pcd-output-cloud-infra-project-473819"
     SONAR_SERVER = "sonarqube"
     GCP_SA_CRED  = "gcp-sa"
-    // Default Hadoop Streaming jar on Dataproc images:
-    HADOOP_STREAMING_JAR = "file:///usr/lib/hadoop-mapreduce/hadoop-streaming.jar"
+    // Use Google's public Hadoop Streaming jar (works across Dataproc images)
+    HADOOP_STREAMING_JAR = "gs://hadoop-lib/hadoop-streaming/hadoop-streaming.jar"
   }
 
+  // Webhook primary; polling as fallback
   triggers { pollSCM('H/10 * * * *') }
 
   stages {
@@ -106,7 +107,10 @@ spec:
 
               echo "== gcloud auth list ==" && gcloud auth list
               echo "== Describe Dataproc cluster ==" && gcloud dataproc clusters describe "${CLUSTER_NAME}" --region "${REGION}" >/dev/null
+
               echo "== Probe GCS bucket ==" && gsutil ls "gs://${BUCKET}/" || true
+              echo "== Probe Hadoop Streaming jar ==" && gsutil ls "${HADOOP_STREAMING_JAR}" >/dev/null
+
               echo "Preflight OK."
             '''
           }
@@ -127,10 +131,10 @@ spec:
 
               INPUT_PATH="gs://${BUCKET}/inputs/${JOB_NAME}/${BUILD_NUMBER}"
 
-              # Clean target prefix quietly if present
+              # Clean target prefix quietly if it exists
               gsutil -m rm -r "${INPUT_PATH}" >/dev/null 2>&1 || true
 
-              # Upload only tracked *.py, preserve paths
+              # Upload only tracked *.py, preserve relative paths
               mkdir -p /tmp/upload_py
               while IFS= read -r f; do
                 mkdir -p "/tmp/upload_py/$(dirname "$f")"
@@ -160,7 +164,7 @@ spec:
               INPUT_PREFIX="gs://${BUCKET}/inputs/${JOB_NAME}/${BUILD_NUMBER}"
               OUT="gs://${BUCKET}/results/${JOB_NAME}/${BUILD_NUMBER}"
 
-              # discover mapper/reducer in repo
+              # Discover mapper/reducer in repo (prefer root)
               MAP=${MAP:-}
               RED=${RED:-}
               if [[ -z "$MAP" ]]; then
@@ -174,14 +178,13 @@ spec:
               echo "Using mapper: $MAP"
               echo "Using reducer: $RED"
 
-              # GCS URIs for -files (localized into working dir on YARN containers)
               MAP_GS="${INPUT_PREFIX}/${MAP}"
               RED_GS="${INPUT_PREFIX}/${RED}"
 
               # Clean output prefix quietly if present
               gsutil -m rm -r "${OUT}" >/dev/null 2>&1 || true
 
-              # Submit Hadoop Streaming job via the streaming JAR
+              # Submit Hadoop Streaming job via GCS-hosted jar
               gcloud dataproc jobs submit hadoop \
                 --cluster="${CLUSTER_NAME}" \
                 --region="${REGION}" \
