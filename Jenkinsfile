@@ -13,8 +13,8 @@ spec:
   restartPolicy: Never
   containers:
     - name: jnlp
-      image: jenkins/inbound-agent:3192.v713e3b_039fb_e-1  # any recent tag is fine
-      args: ['\$(JENKINS_SECRET)', '\$(JENKINS_NAME)']
+      image: jenkins/inbound-agent:3192.v713e3b_039fb_e-1
+      args: ['$(JENKINS_SECRET)', '$(JENKINS_NAME)']
     - name: cloud-sdk
       image: gcr.io/google.com/cloudsdktool/google-cloud-cli:latest
       command: ['cat']
@@ -23,25 +23,22 @@ spec:
       image: sonarsource/sonar-scanner-cli:latest
       command: ['cat']
       tty: true
-      env:
-        - name: SONAR_SCANNER_OPTS
-          value: "-Dsonar.log.level=INFO"
 """
     }
   }
 
-  options { timestamps() }
+  // options { timestamps() }  // <- remove until Timestamper plugin is installed
 
   environment {
     PROJECT_ID   = "cloud-infra-project-473819"
     REGION       = "us-central1"
     CLUSTER_NAME = "hdp-cluster-2"
     BUCKET       = "pcd-output-cloud-infra-project-473819"
-    SONAR_SERVER = "sonarqube"   // name as configured in Manage Jenkins → System
+    SONAR_SERVER = "sonarqube"
   }
 
   triggers {
-    // Webhook is preferred; keep a light poll as fallback
+    // keep as a safety net; webhook should also be configured in the job UI + GitHub
     pollSCM('H/10 * * * *')
   }
 
@@ -57,7 +54,6 @@ spec:
       steps {
         container('sonar') {
           withSonarQubeEnv("${env.SONAR_SERVER}") {
-            // Expose token under the name the CLI expects
             sh '''
               set -e
               export SONAR_TOKEN="$SONAR_AUTH_TOKEN"
@@ -77,7 +73,7 @@ spec:
       steps {
         timeout(time: 10, unit: 'MINUTES') {
           script {
-            def qg = waitForQualityGate()   // requires Jenkins ↔ SonarQube webhook working
+            def qg = waitForQualityGate()
             echo "Quality Gate: ${qg.status}"
             if (qg.status != 'OK') {
               error "Quality Gate failed or has blockers — skipping Hadoop job."
@@ -87,33 +83,28 @@ spec:
       }
     }
 
-    stage('Prep inputs for Hadoop (upload .py files to GCS)') {
+    stage('Prep inputs (upload .py to GCS)') {
       steps {
         container('cloud-sdk') {
           withCredentials([file(credentialsId: 'GCP_SA_KEY', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
             sh '''
               set -euo pipefail
-
               if [ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]; then
                 gcloud auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS"
               fi
               gcloud config set project ${PROJECT_ID}
-
               INPUT_PATH="gs://${BUCKET}/inputs/${JOB_NAME}/${BUILD_NUMBER}"
               gsutil -m rm -r "${INPUT_PATH}" || true
               mkdir -p /tmp/upload_py
-              # Collect all .py files
               find . -type f -name '*.py' -print0 | xargs -0 -I{} cp --parents {} /tmp/upload_py/
-              # Push preserving relative layout
               (cd /tmp/upload_py && gsutil -m cp -r . "${INPUT_PATH}/")
-              echo "Uploaded inputs to ${INPUT_PATH}"
             '''
           }
         }
       }
     }
 
-    stage('Dataproc Hadoop Streaming: Count lines per file') {
+    stage('Dataproc Hadoop Streaming') {
       steps {
         container('cloud-sdk') {
           withCredentials([file(credentialsId: 'GCP_SA_KEY', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
@@ -128,7 +119,6 @@ spec:
               INPUT="gs://${BUCKET}/inputs/${JOB_NAME}/${BUILD_NUMBER}"
               OUT="gs://${BUCKET}/results/${JOB_NAME}/${BUILD_NUMBER}"
 
-              # Ensure mapper/reducer exist in the workspace root
               test -f mapper.py && test -f reducer.py
 
               gsutil -m rm -r "${OUT}" || true
@@ -145,7 +135,6 @@ spec:
                 -input "${INPUT}" \
                 -output "${OUT}"
 
-              echo "Job finished. Results at: ${OUT}"
               gsutil cat "${OUT}"/part-* | tee line_counts.txt
             '''
           }
@@ -156,7 +145,6 @@ spec:
 
   post {
     success {
-      // Nice clickable tab in Jenkins
       publishHTML(target: [
         reportName: 'Hadoop Results',
         reportDir: '.',
@@ -165,10 +153,6 @@ spec:
         alwaysLinkToLastBuild: true,
         allowMissing: true
       ])
-      echo "GCS URL: https://storage.googleapis.com/${env.BUCKET}/results/${env.JOB_NAME}/${env.BUILD_NUMBER}/part-00000"
-    }
-    always {
-      echo "Build #${env.BUILD_NUMBER} finished with status: ${currentBuild.currentResult}"
     }
   }
 }
