@@ -90,7 +90,7 @@ spec:
     stage('Prep inputs (upload .py to GCS)') {
       steps {
         container('cloud-sdk') {
-          withCredentials([file(credentialsId: 'GCP_SA_KEY', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
+          withCredentials([file(credentialsId: 'gcp-sa', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
             sh '''
               set -euo pipefail
 
@@ -118,7 +118,7 @@ spec:
     stage('Dataproc Hadoop Streaming') {
       steps {
         container('cloud-sdk') {
-          withCredentials([file(credentialsId: 'GCP_SA_KEY', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
+          withCredentials([file(credentialsId: 'gcp-sa', variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
             sh '''
               set -euo pipefail
 
