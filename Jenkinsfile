@@ -25,9 +25,7 @@ spec:
     }
   }
 
-  options {
-    skipDefaultCheckout(true)
-  }
+  options { skipDefaultCheckout(true) }
 
   environment {
     PROJECT_ID   = "cloud-infra-project-473819"
@@ -37,15 +35,13 @@ spec:
     SONAR_SERVER = "sonarqube"
     GCP_SA_CRED  = "gcp-sa"
 
-    // Optional override (leave blank to auto-resolve below):
-    // Examples you may set later:
-    //  - "gs://hadoop-lib/hadoop-streaming/hadoop-streaming.jar"
-    //  - "gs://hadoop-lib/hadoop-streaming.jar"
-    //  - "file:///usr/lib/hadoop-mapreduce/hadoop-streaming.jar"
+    // Optional override (leave empty) — if you know a working path, set it to one of:
+    //  - gs://hadoop-lib/hadoop-streaming/hadoop-streaming.jar
+    //  - gs://<your-bucket>/lib/hadoop-streaming-3.3.6.jar
+    //  - file:///usr/lib/hadoop-mapreduce/hadoop-streaming.jar
     HADOOP_STREAMING_JAR = ""
   }
 
-  // Webhook primary; polling as fallback
   triggers { pollSCM('H/10 * * * *') }
 
   stages {
@@ -98,16 +94,16 @@ spec:
       }
     }
 
-    stage('Preflight: GCP & Dataproc connectivity + Resolve streaming JAR') {
+    stage('Preflight: GCP & resolve Hadoop Streaming jar') {
       steps {
         container('cloud-sdk') {
           withCredentials([file(credentialsId: env.GCP_SA_CRED, variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
             sh '''#!/usr/bin/env bash
-              set -euo pipefail
+              set -Eeuo pipefail
 
-              # --- auth / basic checks ---
-              if [[ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
-                gcloud auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS"
+              # auth / config
+              if [[ -f "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
+                gcloud auth activate-service-account --key-file="${GOOGLE_APPLICATION_CREDENTIALS}"
               fi
               gcloud config set project "${PROJECT_ID}"
               gcloud config set dataproc/region "${REGION}"
@@ -116,81 +112,89 @@ spec:
               echo "== Describe Dataproc cluster ==" && gcloud dataproc clusters describe "${CLUSTER_NAME}" --region "${REGION}" >/dev/null
               echo "== Probe GCS bucket ==" && gsutil ls "gs://${BUCKET}/" || true
 
-              # --- resolve Hadoop Streaming JAR ---
-              # Priority:
-              #   1) User-provided env HADOOP_STREAMING_JAR (if set)
-              #   2) Public GCS locations (two common paths)
-              #   3) Local cluster path (file://) – used as a last resort (cannot preflight check remotely)
-              #   4) Download from Maven Central to this workspace and upload to your bucket, then use that GCS path.
+              # Helper: robust downloader (curl -> wget -> python)
+              dl() {
+                local url="$1" out="$2"
+                if command -v curl >/dev/null 2>&1; then
+                  curl -fSL "$url" -o "$out" && return 0
+                fi
+                if command -v wget >/dev/null 2>&1; then
+                  wget -O "$out" "$url" && return 0
+                fi
+                if command -v python3 >/dev/null 2>&1; then
+                  python3 - "$url" "$out" << 'PY'
+import sys, urllib.request
+u,o=sys.argv[1],sys.argv[2]
+urllib.request.urlretrieve(u,o)
+PY
+                  return 0
+                fi
+                echo "No downloader available (curl/wget/python3)"; return 1
+              }
 
-              set +e
+              # Resolve streaming jar
+              HSJ="${HADOOP_STREAMING_JAR:-}"   # safe default avoids 'unbound variable'
               RESOLVED_JAR=""
 
-              # 1) If env provided and is gs://, verify it exists
-              if [[ -n "${HADOOP_STREAMING_JAR}" ]]; then
-                if [[ "${HADOOP_STREAMING_JAR}" == gs://* ]]; then
-                  if gsutil ls "${HADOOP_STREAMING_JAR}" >/dev/null 2>&1; then
-                    RESOLVED_JAR="${HADOOP_STREAMING_JAR}"
-                    echo "Using provided Hadoop Streaming jar: ${RESOLVED_JAR}"
+              # 1) Use provided env if valid
+              if [[ -n "$HSJ" ]]; then
+                if [[ "$HSJ" == gs://* ]]; then
+                  if gsutil ls "$HSJ" >/dev/null 2>&1; then
+                    RESOLVED_JAR="$HSJ"
+                    echo "Using provided Hadoop streaming jar: $RESOLVED_JAR"
                   else
-                    echo "Provided HADOOP_STREAMING_JAR not found: ${HADOOP_STREAMING_JAR}"
+                    echo "Provided HADOOP_STREAMING_JAR not found: $HSJ"
                   fi
                 else
-                  # allow file:/// path (cannot verify remotely)
-                  RESOLVED_JAR="${HADOOP_STREAMING_JAR}"
-                  echo "Using provided Hadoop Streaming jar (non-GCS): ${RESOLVED_JAR}"
+                  # allow file:/// (cannot preflight)
+                  RESOLVED_JAR="$HSJ"
+                  echo "Using provided non-GCS jar path: $RESOLVED_JAR"
                 fi
               fi
 
-              # 2) Try public GCS paths (only if not resolved yet)
-              if [[ -z "${RESOLVED_JAR}" ]]; then
-                for CANDIDATE in \
+              # 2) Try public GCS locations
+              if [[ -z "$RESOLVED_JAR" ]]; then
+                for C in \
                   "gs://hadoop-lib/hadoop-streaming/hadoop-streaming.jar" \
                   "gs://hadoop-lib/hadoop-streaming.jar"
                 do
-                  if gsutil ls "${CANDIDATE}" >/dev/null 2>&1; then
-                    RESOLVED_JAR="${CANDIDATE}"
-                    echo "Resolved Hadoop Streaming jar at public GCS: ${RESOLVED_JAR}"
+                  if gsutil ls "$C" >/dev/null 2>&1; then
+                    RESOLVED_JAR="$C"
+                    echo "Resolved jar via public GCS: $RESOLVED_JAR"
                     break
                   fi
                 done
               fi
 
-              # 3) Try known local path on cluster image (no preflight check possible here)
-              if [[ -z "${RESOLVED_JAR}" ]]; then
+              # 3) Fallback to cluster local path (will still stage a known-good jar next)
+              if [[ -z "$RESOLVED_JAR" ]]; then
                 RESOLVED_JAR="file:///usr/lib/hadoop-mapreduce/hadoop-streaming.jar"
-                echo "Falling back to cluster-local streaming jar path: ${RESOLVED_JAR}"
-                echo "Note: if the Dataproc image lacks this jar, we'll install a GCS jar in the next step."
+                echo "Fallback to cluster-local path: $RESOLVED_JAR"
               fi
 
-              # 4) If we picked the cluster-local path, proactively stage a known-good jar to our bucket and switch to that
-              if [[ "${RESOLVED_JAR}" == file://* ]]; then
-                echo "Staging known-good streaming jar to your bucket as a safety net..."
-                # Choose a Hadoop streaming version compatible with Hadoop 3.x
-                HADOOP_STREAMING_VERSION="3.3.6"
-                LOCAL_JAR="hadoop-streaming-${HADOOP_STREAMING_VERSION}.jar"
-                JAR_URL="https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-streaming/${HADOOP_STREAMING_VERSION}/hadoop-streaming-${HADOOP_STREAMING_VERSION}.jar"
-                TARGET_GS="gs://${BUCKET}/lib/${LOCAL_JAR}"
+              # 4) Stage known-good jar to your bucket and switch to it
+              #    (ensures success even if cluster-local path doesn't exist)
+              if [[ "$RESOLVED_JAR" == file://* ]]; then
+                HVER="3.3.6"
+                LOCAL="hadoop-streaming-${HVER}.jar"
+                URL="https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-streaming/${HVER}/hadoop-streaming-${HVER}.jar"
+                TARGET="gs://${BUCKET}/lib/${LOCAL}"
 
-                # Download and upload only if not already present
-                if ! gsutil ls "${TARGET_GS}" >/dev/null 2>&1; then
-                  echo "Downloading ${JAR_URL} ..."
-                  curl -fSL "${JAR_URL}" -o "${LOCAL_JAR}"
-                  echo "Uploading to ${TARGET_GS} ..."
-                  gsutil cp "${LOCAL_JAR}" "${TARGET_GS}"
+                if ! gsutil ls "$TARGET" >/dev/null 2>&1; then
+                  echo "Downloading $URL ..."
+                  dl "$URL" "$LOCAL"
+                  echo "Uploading to $TARGET ..."
+                  gsutil cp "$LOCAL" "$TARGET"
                 else
-                  echo "Jar already present at ${TARGET_GS}."
+                  echo "Jar already present at $TARGET"
                 fi
-
-                # Use the staged jar from your bucket
-                RESOLVED_JAR="${TARGET_GS}"
-                echo "Resolved Hadoop Streaming jar (staged): ${RESOLVED_JAR}"
+                RESOLVED_JAR="$TARGET"
+                echo "Resolved jar (staged): $RESOLVED_JAR"
               fi
 
-              # Persist for later stages
-              echo "HADOOP_STREAMING_RESOLVED_JAR=${RESOLVED_JAR}" > .resolved_jar.env
-              set -e
-              echo "Preflight OK. Using streaming jar: ${RESOLVED_JAR}"
+              # Persist for next stage
+              echo "export HADOOP_STREAMING_RESOLVED_JAR=\"$RESOLVED_JAR\"" > .resolved_jar.env
+              echo "Preflight OK. Using streaming jar: $RESOLVED_JAR"
             '''
           }
         }
@@ -202,18 +206,16 @@ spec:
         container('cloud-sdk') {
           withCredentials([file(credentialsId: env.GCP_SA_CRED, variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
             sh '''#!/usr/bin/env bash
-              set -euo pipefail
-              if [[ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
-                gcloud auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS"
+              set -Eeuo pipefail
+              if [[ -f "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
+                gcloud auth activate-service-account --key-file="${GOOGLE_APPLICATION_CREDENTIALS}"
               fi
               gcloud config set project "${PROJECT_ID}"
 
               INPUT_PATH="gs://${BUCKET}/inputs/${JOB_NAME}/${BUILD_NUMBER}"
 
-              # Clean target prefix quietly if it exists
               gsutil -m rm -r "${INPUT_PATH}" >/dev/null 2>&1 || true
 
-              # Upload only tracked *.py, preserve relative paths
               mkdir -p /tmp/upload_py
               while IFS= read -r f; do
                 mkdir -p "/tmp/upload_py/$(dirname "$f")"
@@ -233,23 +235,23 @@ spec:
         container('cloud-sdk') {
           withCredentials([file(credentialsId: env.GCP_SA_CRED, variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
             sh '''#!/usr/bin/env bash
-              set -euo pipefail
-              if [[ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
-                gcloud auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS"
+              set -Eeuo pipefail
+              if [[ -f "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
+                gcloud auth activate-service-account --key-file="${GOOGLE_APPLICATION_CREDENTIALS}"
               fi
               gcloud config set project "${PROJECT_ID}"
               gcloud config set dataproc/region "${REGION}"
 
-              # Load the resolved jar path from preflight
+              # load resolved jar
               source .resolved_jar.env
               echo "Submitting with streaming JAR: ${HADOOP_STREAMING_RESOLVED_JAR}"
 
               INPUT_PREFIX="gs://${BUCKET}/inputs/${JOB_NAME}/${BUILD_NUMBER}"
               OUT="gs://${BUCKET}/results/${JOB_NAME}/${BUILD_NUMBER}"
 
-              # Discover mapper/reducer in repo (prefer root)
-              MAP=${MAP:-}
-              RED=${RED:-}
+              # discover mapper / reducer
+              MAP="${MAP:-}"
+              RED="${RED:-}"
               if [[ -z "$MAP" ]]; then
                 if [[ -f mapper.py ]]; then MAP=mapper.py; else MAP="$(git ls-files | grep -E '/?mapper\\.py$' | head -n1)"; fi
               fi
@@ -264,10 +266,8 @@ spec:
               MAP_GS="${INPUT_PREFIX}/${MAP}"
               RED_GS="${INPUT_PREFIX}/${RED}"
 
-              # Clean output prefix quietly if present
               gsutil -m rm -r "${OUT}" >/dev/null 2>&1 || true
 
-              # Submit Hadoop Streaming job
               gcloud dataproc jobs submit hadoop \
                 --cluster="${CLUSTER_NAME}" \
                 --region="${REGION}" \
@@ -281,7 +281,6 @@ spec:
                 -input "${INPUT_PREFIX}" \
                 -output "${OUT}"
 
-              # Print results
               gsutil cat "${OUT}"/part-* | tee line_counts.txt
             '''
           }
