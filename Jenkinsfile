@@ -27,7 +27,6 @@ spec:
 
   options {
     skipDefaultCheckout(true)
-    // timestamps()   // enable after installing Timestamper plugin
   }
 
   environment {
@@ -35,18 +34,18 @@ spec:
     REGION       = "us-central1"
     CLUSTER_NAME = "hdp-cluster-2"
     BUCKET       = "pcd-output-cloud-infra-project-473819"
-    SONAR_SERVER = "sonarqube"  // Jenkins > Manage Jenkins > System > SonarQube servers
-    GCP_SA_CRED  = "gcp-sa"     // Jenkins credential ID (Secret file) for your GCP SA JSON
+    SONAR_SERVER = "sonarqube"
+    GCP_SA_CRED  = "gcp-sa"
+    // Default Hadoop Streaming jar on Dataproc images:
+    HADOOP_STREAMING_JAR = "file:///usr/lib/hadoop-mapreduce/hadoop-streaming.jar"
   }
 
-  // Webhook is primary; polling is a fallback
   triggers { pollSCM('H/10 * * * *') }
 
   stages {
     stage('Checkout') {
       steps {
         container('cloud-sdk') {
-          // trust workspace directory for Git and check out the repo
           sh '''#!/usr/bin/env bash
             set -e
             git config --global --add safe.directory '*'
@@ -105,15 +104,9 @@ spec:
               gcloud config set project "${PROJECT_ID}"
               gcloud config set dataproc/region "${REGION}"
 
-              echo "== gcloud auth list =="
-              gcloud auth list
-
-              echo "== Describe Dataproc cluster =="
-              gcloud dataproc clusters describe "${CLUSTER_NAME}" --region "${REGION}" >/dev/null
-
-              echo "== Probe GCS bucket =="
-              gsutil ls "gs://${BUCKET}/" || true
-
+              echo "== gcloud auth list ==" && gcloud auth list
+              echo "== Describe Dataproc cluster ==" && gcloud dataproc clusters describe "${CLUSTER_NAME}" --region "${REGION}" >/dev/null
+              echo "== Probe GCS bucket ==" && gsutil ls "gs://${BUCKET}/" || true
               echo "Preflight OK."
             '''
           }
@@ -133,9 +126,11 @@ spec:
               gcloud config set project "${PROJECT_ID}"
 
               INPUT_PATH="gs://${BUCKET}/inputs/${JOB_NAME}/${BUILD_NUMBER}"
-              gsutil -m rm -r "${INPUT_PATH}" || true
 
-              # Only tracked *.py files; preserve relative paths
+              # Clean target prefix quietly if present
+              gsutil -m rm -r "${INPUT_PATH}" >/dev/null 2>&1 || true
+
+              # Upload only tracked *.py, preserve paths
               mkdir -p /tmp/upload_py
               while IFS= read -r f; do
                 mkdir -p "/tmp/upload_py/$(dirname "$f")"
@@ -162,10 +157,10 @@ spec:
               gcloud config set project "${PROJECT_ID}"
               gcloud config set dataproc/region "${REGION}"
 
-              INPUT="gs://${BUCKET}/inputs/${JOB_NAME}/${BUILD_NUMBER}"
+              INPUT_PREFIX="gs://${BUCKET}/inputs/${JOB_NAME}/${BUILD_NUMBER}"
               OUT="gs://${BUCKET}/results/${JOB_NAME}/${BUILD_NUMBER}"
 
-              # Find mapper/reducer anywhere in repo (prefer root)
+              # discover mapper/reducer in repo
               MAP=${MAP:-}
               RED=${RED:-}
               if [[ -z "$MAP" ]]; then
@@ -179,20 +174,28 @@ spec:
               echo "Using mapper: $MAP"
               echo "Using reducer: $RED"
 
-              gsutil -m rm -r "${OUT}" || true
+              # GCS URIs for -files (localized into working dir on YARN containers)
+              MAP_GS="${INPUT_PREFIX}/${MAP}"
+              RED_GS="${INPUT_PREFIX}/${RED}"
 
+              # Clean output prefix quietly if present
+              gsutil -m rm -r "${OUT}" >/dev/null 2>&1 || true
+
+              # Submit Hadoop Streaming job via the streaming JAR
               gcloud dataproc jobs submit hadoop \
                 --cluster="${CLUSTER_NAME}" \
                 --region="${REGION}" \
+                --jar="${HADOOP_STREAMING_JAR}" \
                 -- \
                 -D mapreduce.job.maps=4 \
                 -D mapreduce.job.reduces=2 \
-                -files "$MAP,$RED" \
-                -mapper "python3 $(basename "$MAP")" \
-                -reducer "python3 $(basename "$RED")" \
-                -input "${INPUT}" \
+                -files "${MAP_GS},${RED_GS}" \
+                -mapper "python3 $(basename "${MAP}")" \
+                -reducer "python3 $(basename "${RED}")" \
+                -input "${INPUT_PREFIX}" \
                 -output "${OUT}"
 
+              # Print results
               gsutil cat "${OUT}"/part-* | tee line_counts.txt
             '''
           }
