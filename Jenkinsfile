@@ -2,7 +2,7 @@ pipeline {
   agent {
     kubernetes {
       defaultContainer 'cloud-sdk'
-      yaml """
+      yaml '''
 apiVersion: v1
 kind: Pod
 metadata:
@@ -23,11 +23,9 @@ spec:
       image: sonarsource/sonar-scanner-cli:latest
       command: ['cat']
       tty: true
-"""
+'''
     }
   }
-
-  // options { timestamps() }  // <- remove until Timestamper plugin is installed
 
   environment {
     PROJECT_ID   = "cloud-infra-project-473819"
@@ -38,7 +36,7 @@ spec:
   }
 
   triggers {
-    // keep as a safety net; webhook should also be configured in the job UI + GitHub
+    // keep as fallback; primary is GitHub webhook
     pollSCM('H/10 * * * *')
   }
 
