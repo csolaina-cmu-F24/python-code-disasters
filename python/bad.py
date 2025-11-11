@@ -1,2 +1,2 @@
 def oops():
-    return 12/0
+    return 112/0
