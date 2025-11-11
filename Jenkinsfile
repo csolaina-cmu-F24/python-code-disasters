@@ -25,30 +25,37 @@ spec:
     }
   }
 
-  options { skipDefaultCheckout(true) }
+  options {
+    skipDefaultCheckout(true)
+    // timestamps()   // enable after installing Timestamper plugin
+  }
 
   environment {
     PROJECT_ID   = "cloud-infra-project-473819"
     REGION       = "us-central1"
     CLUSTER_NAME = "hdp-cluster-2"
     BUCKET       = "pcd-output-cloud-infra-project-473819"
-    SONAR_SERVER = "sonarqube"
-    // Set your Jenkins file credential ID for the GCP SA key:
-    GCP_SA_CRED  = "gcp-sa"
+    SONAR_SERVER = "sonarqube"  // Jenkins > Manage Jenkins > System > SonarQube servers
+    GCP_SA_CRED  = "gcp-sa"     // Jenkins credential ID (Secret file) for your GCP SA JSON
   }
 
+  // Webhook is primary; polling is a fallback
   triggers { pollSCM('H/10 * * * *') }
 
   stages {
     stage('Checkout') {
       steps {
         container('cloud-sdk') {
-          // Use bash to avoid dash quirks
-          sh(script: '''
+          // trust workspace directory for Git and check out the repo
+          sh '''#!/usr/bin/env bash
+            set -e
             git config --global --add safe.directory '*'
-          ''', shell: '/bin/bash')
+          '''
           checkout scm
-          sh(script: 'git rev-parse --short HEAD', shell: '/bin/bash')
+          sh '''#!/usr/bin/env bash
+            set -e
+            git rev-parse --short HEAD
+          '''
         }
       }
     }
@@ -57,7 +64,7 @@ spec:
       steps {
         container('sonar') {
           withSonarQubeEnv("${env.SONAR_SERVER}") {
-            sh(script: '''
+            sh '''#!/usr/bin/env bash
               set -e
               export SONAR_TOKEN="$SONAR_AUTH_TOKEN"
               sonar-scanner \
@@ -66,7 +73,7 @@ spec:
                 -Dsonar.projectVersion=${BUILD_NUMBER} \
                 -Dsonar.sources=. \
                 -Dsonar.python.version=3
-            ''', shell: '/bin/bash')
+            '''
           }
         }
       }
@@ -77,8 +84,8 @@ spec:
         timeout(time: 20, unit: 'MINUTES') {
           script {
             def qg = waitForQualityGate(abortPipeline: false)
-            echo "Quality Gate initial status: ${qg?.status ?: 'UNKNOWN'}"
-            if (qg == null || (qg.status != 'OK' && qg.status != 'SUCCESS')) {
+            echo "Quality Gate: ${qg?.status ?: 'UNKNOWN'}"
+            if (!qg || (qg.status != 'OK' && qg.status != 'SUCCESS')) {
               error "Quality Gate failed or not OK (status=${qg?.status})."
             }
           }
@@ -90,7 +97,7 @@ spec:
       steps {
         container('cloud-sdk') {
           withCredentials([file(credentialsId: env.GCP_SA_CRED, variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
-            sh(script: '''
+            sh '''#!/usr/bin/env bash
               set -euo pipefail
               if [[ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
                 gcloud auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS"
@@ -108,7 +115,7 @@ spec:
               gsutil ls "gs://${BUCKET}/" || true
 
               echo "Preflight OK."
-            ''', shell: '/bin/bash')
+            '''
           }
         }
       }
@@ -118,7 +125,7 @@ spec:
       steps {
         container('cloud-sdk') {
           withCredentials([file(credentialsId: env.GCP_SA_CRED, variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
-            sh(script: '''
+            sh '''#!/usr/bin/env bash
               set -euo pipefail
               if [[ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
                 gcloud auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS"
@@ -128,7 +135,7 @@ spec:
               INPUT_PATH="gs://${BUCKET}/inputs/${JOB_NAME}/${BUILD_NUMBER}"
               gsutil -m rm -r "${INPUT_PATH}" || true
 
-              # Collect only tracked *.py files and preserve paths
+              # Only tracked *.py files; preserve relative paths
               mkdir -p /tmp/upload_py
               while IFS= read -r f; do
                 mkdir -p "/tmp/upload_py/$(dirname "$f")"
@@ -137,7 +144,7 @@ spec:
 
               (cd /tmp/upload_py && gsutil -m cp -r . "${INPUT_PATH}/")
               echo "Uploaded inputs to ${INPUT_PATH}"
-            ''', shell: '/bin/bash')
+            '''
           }
         }
       }
@@ -147,7 +154,7 @@ spec:
       steps {
         container('cloud-sdk') {
           withCredentials([file(credentialsId: env.GCP_SA_CRED, variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
-            sh(script: '''
+            sh '''#!/usr/bin/env bash
               set -euo pipefail
               if [[ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
                 gcloud auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS"
@@ -158,7 +165,7 @@ spec:
               INPUT="gs://${BUCKET}/inputs/${JOB_NAME}/${BUILD_NUMBER}"
               OUT="gs://${BUCKET}/results/${JOB_NAME}/${BUILD_NUMBER}"
 
-              # Locate mapper/reducer anywhere in repo (prefers root if present)
+              # Find mapper/reducer anywhere in repo (prefer root)
               MAP=${MAP:-}
               RED=${RED:-}
               if [[ -z "$MAP" ]]; then
@@ -187,7 +194,7 @@ spec:
                 -output "${OUT}"
 
               gsutil cat "${OUT}"/part-* | tee line_counts.txt
-            ''', shell: '/bin/bash')
+            '''
           }
         }
       }
