@@ -28,10 +28,10 @@ spec:
   options { skipDefaultCheckout(true) }
 
   environment {
-    PROJECT_ID   = "cloud-infra-project-473819"
+    PROJECT_ID   = "cloud-infra-project-2-478104"
     REGION       = "us-central1"
     CLUSTER_NAME = "hdp-cluster-2"
-    BUCKET       = "pcd-output-cloud-infra-project-473819"
+    BUCKET       = "pcd-output-cloud-infra-project-2-478104"
     SONAR_SERVER = "sonarqube"
     GCP_SA_CRED  = "gcp-sa"
 
